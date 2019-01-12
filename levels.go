@@ -22,8 +22,6 @@ import (
 	"math/rand"
 	"os"
 	"sort"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/trace"
@@ -102,87 +100,53 @@ func newLevelsController(kv *DB, mf *Manifest) (*levelsController, error) {
 		return nil, err
 	}
 
-	// Some files may be deleted. Let's reload.
 	var flags uint32 = y.Sync
 	if kv.opt.ReadOnly {
 		flags |= y.ReadOnly
 	}
 
-	tables := make([][]*table.Table, kv.opt.MaxLevels)
-	var mu sync.Mutex
-	var maxFileID uint64
-
-	// Make errCh non-blocking for iteration over mf.Tables.
-	errCh := make(chan error, len(mf.Tables))
-
-	// 8 goroutines makes loading significantly slower, based on my testing with external HDD.
-	throttleCh := make(chan struct{}, 8)
-	flushThrottle := func() error {
-		close(throttleCh)
-		for range throttleCh {
-		}
-		close(errCh)
-		for err := range errCh {
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
+	// The following variables are useful for reporting opening status to users.
 	start := time.Now()
-	var numOpened int32
-	tick := time.NewTicker(3 * time.Second)
-	defer tick.Stop()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	var count int
 
+	// Some files may be deleted. Let's reload.
+	tables := make([][]*table.Table, kv.opt.MaxLevels)
+	var maxFileID uint64
 	for fileID, tableManifest := range mf.Tables {
 		fname := table.NewFilename(fileID, kv.opt.Dir)
-		Infof("Opening file: %s\n", fname)
-	THROTTLE:
-		for {
-			select {
-			case throttleCh <- struct{}{}:
-				break THROTTLE
-			case <-tick.C:
-				Infof("%d tables opened in %s\n", atomic.LoadInt32(&numOpened),
-					time.Since(start).Round(time.Millisecond))
-			case err := <-errCh:
-				if err != nil {
-					flushThrottle()
-					closeAllTables(tables)
-					return nil, err
-				}
-			}
+		fd, err := y.OpenExistingFile(fname, flags)
+		if err != nil {
+			closeAllTables(tables)
+			return nil, errors.Wrapf(err, "Opening file: %q", fname)
 		}
+
+		// I've tried making this part concurrent, but it doesn't help. Tested on both HDD and SSD,
+		// with up to 100 and 250 MBps sequential read speed. If anything, it makes things slower.
+		t, err := table.OpenTable(fd, kv.opt.TableLoadingMode)
+		if err != nil {
+			closeAllTables(tables)
+			return nil, errors.Wrapf(err, "Opening table: %q", fname)
+		}
+
+		// Let the user know how fast things are going.
+		count++
+		select {
+		case <-ticker.C:
+			Infof("Opened %d SSTables out of %d in %s\n", count,
+				len(mf.Tables), time.Since(start).Round(time.Millisecond))
+		default:
+		}
+
+		level := tableManifest.Level
+		tables[level] = append(tables[level], t)
+
 		if fileID > maxFileID {
 			maxFileID = fileID
 		}
-		go func(fname string, level int) {
-			defer func() {
-				<-throttleCh
-				atomic.AddInt32(&numOpened, 1)
-			}()
-			fd, err := y.OpenExistingFile(fname, flags)
-			if err != nil {
-				errCh <- errors.Wrapf(err, "Opening file: %q", fname)
-			}
-
-			t, err := table.OpenTable(fd, kv.opt.TableLoadingMode)
-			if err != nil {
-				errCh <- errors.Wrapf(err, "Opening table: %q", fname)
-			}
-
-			mu.Lock()
-			tables[level] = append(tables[level], t)
-			mu.Unlock()
-		}(fname, int(tableManifest.Level))
 	}
-	if err := flushThrottle(); err != nil {
-		closeAllTables(tables)
-		return nil, err
-	}
-	Infof("All %d tables opened in %s\n", atomic.LoadInt32(&numOpened),
-		time.Since(start).Round(time.Millisecond))
+	Infof("Opened all %d SSTables in %s\n", count, time.Since(start).Round(time.Millisecond))
 	s.nextFileID = maxFileID + 1
 	for i, tbls := range tables {
 		s.levels[i].initTables(tbls)
